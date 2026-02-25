@@ -60,12 +60,9 @@ export default function App() {
         if (cancelled) return;
         setProfiles(nextProfiles);
 
-        let currentProfileId = activeProfileId;
-        if (currentProfileId && !nextProfiles.some((p) => p.id === currentProfileId)) {
-          currentProfileId = null;
-        }
-        if (!currentProfileId && nextProfiles.length > 0) {
-          currentProfileId = nextProfiles[0].id;
+        // Single-account-per-device UI mode: use one active local profile only.
+        let currentProfileId = nextProfiles[0]?.id ?? null;
+        if (currentProfileId && currentProfileId !== activeProfileId) {
           repo.setActiveProfileId(currentProfileId);
           setActiveProfileId(currentProfileId);
         }
@@ -156,11 +153,6 @@ export default function App() {
     setToasts((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, text, tone }]);
   }
 
-  function handleSelectProfile(profileId: string) {
-    repo.setActiveProfileId(profileId);
-    setActiveProfileId(profileId);
-  }
-
   function handleSelectChat(chatId: string) {
     if (!activeProfileId) return;
     repo.setSelectedChatForProfile(activeProfileId, chatId);
@@ -171,6 +163,10 @@ export default function App() {
 
   async function handleCreateProfile(name: string) {
     try {
+      if (profiles.length > 0) {
+        toast("This build supports one local account per device.", "error");
+        return;
+      }
       const profile = await repo.createProfile(name);
       repo.setActiveProfileId(profile.id);
       setActiveProfileId(profile.id);
@@ -272,26 +268,33 @@ export default function App() {
             <div className="brand">Local Texting</div>
             <div className="brand-subtle">Frontend + storage only</div>
           </div>
-          <button className="ghost-btn" onClick={() => setDialog("createProfile")}>
-            + Profile
-          </button>
+          {!activeProfile && (
+            <button className="ghost-btn" onClick={() => setDialog("createProfile")}>
+              Create Account
+            </button>
+          )}
         </div>
 
         <div className="profile-card">
-          <label className="label">Active profile</label>
-          <div className="profile-switch-row">
-            <select
-              value={activeProfileId ?? ""}
-              onChange={(e) => handleSelectProfile(e.target.value)}
-              className="select"
-            >
-              {profiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profile.displayName}
-                </option>
-              ))}
-            </select>
-          </div>
+          <label className="label">Account</label>
+          {activeProfile ? (
+            <div className="member-row">
+              <span className="avatar-dot" style={{ backgroundColor: activeProfile.avatarColor }} />
+              <div>
+                <div>{activeProfile.displayName}</div>
+                <div className="brand-subtle">This device account</div>
+              </div>
+            </div>
+          ) : (
+            <div className="sidebar-empty">
+              No account yet.
+              <div style={{ marginTop: "0.5rem" }}>
+                <button className="ghost-btn small" onClick={() => setDialog("createProfile")}>
+                  Create Account
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <SidebarSection
@@ -316,7 +319,11 @@ export default function App() {
         {!selectedChat || !activeProfile ? (
           <div className="empty-state">
             <h2>No chat selected</h2>
-            <p>Select a DM or group from the sidebar to start messaging.</p>
+            <p>
+              {activeProfile
+                ? "Select a DM or group from the sidebar to start messaging."
+                : "Create an account on this device to start."}
+            </p>
           </div>
         ) : (
           <ChatView
@@ -626,7 +633,7 @@ function Composer(props: {
 function CreateProfileDialog(props: { onClose: () => void; onSubmit: (name: string) => Promise<void> }) {
   const [name, setName] = useState("");
   return (
-    <Modal title="Create Profile" onClose={props.onClose}>
+    <Modal title="Create Account" onClose={props.onClose}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -634,14 +641,14 @@ function CreateProfileDialog(props: { onClose: () => void; onSubmit: (name: stri
           void props.onSubmit(name);
         }}
       >
-        <label className="label">Display name</label>
+        <label className="label">Account name</label>
         <input className="text-input" value={name} onChange={(e) => setName(e.target.value)} />
         <div className="dialog-actions">
           <button type="button" className="ghost-btn" onClick={props.onClose}>
             Cancel
           </button>
           <button className="send-btn" type="submit" disabled={!name.trim()}>
-            Create
+            Create Account
           </button>
         </div>
       </form>
