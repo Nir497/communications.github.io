@@ -508,24 +508,19 @@ function AuthGate(props: {
           </p>
         </div>
 
-        <div className="auth-tabs">
-          <button
-            className={`ghost-btn ${mode === "signup" ? "active-tab" : ""}`}
-            disabled={hasAccount}
-            onClick={() => setMode("signup")}
-            type="button"
-          >
-            Sign Up
-          </button>
-          <button
-            className={`ghost-btn ${mode === "signin" ? "active-tab" : ""}`}
-            disabled={!hasAccount || needsPasswordSetup}
-            onClick={() => setMode("signin")}
-            type="button"
-          >
-            Sign In
-          </button>
-        </div>
+        {!hasAccount ? (
+          <div className="auth-tabs auth-single-tab">
+            <button className="ghost-btn active-tab" type="button">
+              Sign Up
+            </button>
+          </div>
+        ) : !needsPasswordSetup ? (
+          <div className="auth-tabs auth-single-tab">
+            <button className="ghost-btn active-tab" type="button">
+              Sign In
+            </button>
+          </div>
+        ) : null}
 
         <form onSubmit={(e) => void submit(e)} className="auth-form">
           {mode === "signup" ? (

@@ -80,6 +80,10 @@ textarea {
   margin-bottom: 0.8rem;
 }
 
+.auth-single-tab {
+  grid-template-columns: 1fr;
+}
+
 .active-tab {
   background: #e0f2fe;
   border-color: #7dd3fc;
