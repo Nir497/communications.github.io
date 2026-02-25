@@ -9,6 +9,9 @@ export interface Profile {
   id: ProfileId;
   displayName: string;
   avatarColor: string;
+  passwordSalt?: string;
+  passwordHash?: string;
+  passwordIterations?: number;
   createdAt: number;
   updatedAt: number;
 }

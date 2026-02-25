@@ -12,6 +12,7 @@ const repo = new ChatRepository(syncBus);
 
 export default function App() {
   const [ready, setReady] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
@@ -29,10 +30,10 @@ export default function App() {
     async function boot() {
       try {
         await repo.init();
-        await repo.seedDemoDataIfNeeded();
         const prefs = repo.getPreferences();
         if (cancelled) return;
         setActiveProfileId(prefs.activeProfileId);
+        setIsAuthenticated(Boolean(repo.getAuthenticatedProfileId()));
         setReady(true);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to initialize app storage");
@@ -67,6 +68,15 @@ export default function App() {
           setActiveProfileId(currentProfileId);
         }
         if (!currentProfileId) {
+          setChatItems([]);
+          setSelectedChatId(null);
+          setSelectedChat(null);
+          setMessages([]);
+          setChatMembers([]);
+          return;
+        }
+
+        if (!isAuthenticated) {
           setChatItems([]);
           setSelectedChatId(null);
           setSelectedChat(null);
@@ -131,7 +141,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [ready, activeProfileId, refreshTick]);
+  }, [ready, activeProfileId, isAuthenticated, refreshTick]);
 
   useEffect(() => {
     if (toasts.length === 0) return;
@@ -175,6 +185,56 @@ export default function App() {
     } catch (e) {
       toast(e instanceof Error ? e.message : "Failed to create profile", "error");
     }
+  }
+
+  async function handleSignUp(name: string, password: string) {
+    try {
+      const profile = await repo.signUpLocalAccount(name, password);
+      setActiveProfileId(profile.id);
+      setIsAuthenticated(true);
+      setRefreshTick((v) => v + 1);
+      toast(`Account "${profile.displayName}" created`);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to sign up", "error");
+      throw e;
+    }
+  }
+
+  async function handleSignIn(password: string) {
+    try {
+      const profile = await repo.signInLocalAccount(password);
+      setActiveProfileId(profile.id);
+      setIsAuthenticated(true);
+      setRefreshTick((v) => v + 1);
+      toast(`Signed in as ${profile.displayName}`);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to sign in", "error");
+      throw e;
+    }
+  }
+
+  async function handleSetPassword(password: string) {
+    try {
+      const profile = await repo.setPasswordForExistingLocalAccount(password);
+      setActiveProfileId(profile.id);
+      setIsAuthenticated(true);
+      setRefreshTick((v) => v + 1);
+      toast("Password set. You are signed in.");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to set password", "error");
+      throw e;
+    }
+  }
+
+  function handleSignOut() {
+    repo.signOut();
+    setIsAuthenticated(false);
+    setSelectedChatId(null);
+    setSelectedChat(null);
+    setMessages([]);
+    setChatMembers([]);
+    navigateHome();
+    toast("Signed out");
   }
 
   async function handleCreateDm(otherProfileId: string) {
@@ -260,6 +320,26 @@ export default function App() {
     return <div className="loading-screen">Loading local chats...</div>;
   }
 
+  if (!isAuthenticated) {
+    return (
+      <>
+        <AuthGate
+          existingProfile={profiles[0] ?? null}
+          onSignUp={handleSignUp}
+          onSignIn={handleSignIn}
+          onSetPassword={handleSetPassword}
+        />
+        <div className="toast-stack" aria-live="polite">
+          {toasts.map((item) => (
+            <div key={item.id} className={`toast ${item.tone === "error" ? "toast-error" : ""}`}>
+              {item.text}
+            </div>
+          ))}
+        </div>
+      </>
+    );
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -268,11 +348,9 @@ export default function App() {
             <div className="brand">Local Texting</div>
             <div className="brand-subtle">Frontend + storage only</div>
           </div>
-          {!activeProfile && (
-            <button className="ghost-btn" onClick={() => setDialog("createProfile")}>
-              Create Account
-            </button>
-          )}
+          <button className="ghost-btn" onClick={handleSignOut}>
+            Sign Out
+          </button>
         </div>
 
         <div className="profile-card">
@@ -287,12 +365,7 @@ export default function App() {
             </div>
           ) : (
             <div className="sidebar-empty">
-              No account yet.
-              <div style={{ marginTop: "0.5rem" }}>
-                <button className="ghost-btn small" onClick={() => setDialog("createProfile")}>
-                  Create Account
-                </button>
-              </div>
+              No authenticated account.
             </div>
           )}
         </div>
@@ -342,9 +415,6 @@ export default function App() {
         )}
       </main>
 
-      {dialog === "createProfile" && (
-        <CreateProfileDialog onClose={() => setDialog(null)} onSubmit={handleCreateProfile} />
-      )}
       {dialog === "createDm" && activeProfileId && (
         <CreateDmDialog
           profiles={profiles.filter((p) => p.id !== activeProfileId)}
@@ -372,6 +442,174 @@ export default function App() {
             {item.text}
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function AuthGate(props: {
+  existingProfile: Profile | null;
+  onSignUp: (name: string, password: string) => Promise<void>;
+  onSignIn: (password: string) => Promise<void>;
+  onSetPassword: (password: string) => Promise<void>;
+}) {
+  const hasAccount = Boolean(props.existingProfile);
+  const needsPasswordSetup = Boolean(props.existingProfile && !props.existingProfile.passwordHash);
+  const [mode, setMode] = useState<"signup" | "signin" | "setup">(
+    !hasAccount ? "signup" : needsPasswordSetup ? "setup" : "signin",
+  );
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setMode(!props.existingProfile ? "signup" : !props.existingProfile.passwordHash ? "setup" : "signin");
+  }, [props.existingProfile]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setLocalError(null);
+    try {
+      if (mode === "signup") {
+        if (!name.trim()) throw new Error("Enter an account name");
+        if (password.length < 6) throw new Error("Password must be at least 6 characters");
+        if (password !== confirmPassword) throw new Error("Passwords do not match");
+        await props.onSignUp(name, password);
+      } else if (mode === "setup") {
+        if (password.length < 6) throw new Error("Password must be at least 6 characters");
+        if (password !== confirmPassword) throw new Error("Passwords do not match");
+        await props.onSetPassword(password);
+      } else {
+        if (!password) throw new Error("Enter your password");
+        await props.onSignIn(password);
+      }
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : "Authentication failed");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="auth-shell">
+      <div className="auth-card">
+        <div className="auth-header">
+          <div className="brand">Local Texting</div>
+          <p className="brand-subtle">
+            {hasAccount
+              ? needsPasswordSetup
+                ? `Set a password for ${props.existingProfile?.displayName}`
+                : `Sign in to ${props.existingProfile?.displayName}`
+              : "Create an account for this browser/device"}
+          </p>
+        </div>
+
+        <div className="auth-tabs">
+          <button
+            className={`ghost-btn ${mode === "signup" ? "active-tab" : ""}`}
+            disabled={hasAccount}
+            onClick={() => setMode("signup")}
+            type="button"
+          >
+            Sign Up
+          </button>
+          <button
+            className={`ghost-btn ${mode === "signin" ? "active-tab" : ""}`}
+            disabled={!hasAccount || needsPasswordSetup}
+            onClick={() => setMode("signin")}
+            type="button"
+          >
+            Sign In
+          </button>
+        </div>
+
+        <form onSubmit={(e) => void submit(e)} className="auth-form">
+          {mode === "signup" ? (
+            <>
+              <label className="label">Account name</label>
+              <input className="text-input" value={name} onChange={(e) => setName(e.target.value)} />
+              <label className="label">Password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+              <label className="label">Confirm password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </>
+          ) : mode === "setup" ? (
+            <>
+              <label className="label">Account</label>
+              <div className="member-row">
+                <span
+                  className="avatar-dot"
+                  style={{ backgroundColor: props.existingProfile?.avatarColor ?? "#0ea5e9" }}
+                />
+                {props.existingProfile?.displayName ?? "Local Account"}
+              </div>
+              <label className="label">New password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+              <label className="label">Confirm password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </>
+          ) : (
+            <>
+              <label className="label">Account</label>
+              <div className="member-row">
+                <span
+                  className="avatar-dot"
+                  style={{ backgroundColor: props.existingProfile?.avatarColor ?? "#0ea5e9" }}
+                />
+                {props.existingProfile?.displayName ?? "Local Account"}
+              </div>
+              <label className="label">Password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+            </>
+          )}
+          <button className="send-btn auth-submit" type="submit" disabled={submitting}>
+            {submitting
+              ? "Please wait..."
+              : mode === "signup"
+                ? "Create Account"
+                : mode === "setup"
+                  ? "Set Password"
+                  : "Sign In"}
+          </button>
+          {localError && <div className="auth-error">{localError}</div>}
+          <p className="auth-note">
+            GitHub Pages can host this frontend, but real cross-device messaging/accounts require a backend service.
+          </p>
+        </form>
       </div>
     </div>
   );

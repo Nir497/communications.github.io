@@ -15,6 +15,7 @@ import type {
   SyncEvent,
   ValidationResult,
 } from "../types";
+import { createPasswordRecord, verifyPassword } from "../auth";
 import { createId, isImageMime, pickAvatarColor } from "../utils";
 import { SyncBus } from "./syncBus";
 
@@ -32,6 +33,7 @@ const STORE_KV = "kv";
 const PREF_ACTIVE_PROFILE = "ltx:activeProfileId";
 const PREF_SELECTED_BY_PROFILE = "ltx:selectedChatByProfile";
 const PREF_SEEDED = "ltx:hasSeededDemoData";
+const PREF_AUTH_PROFILE = "ltx:authProfileId";
 
 export interface AppPreferences {
   activeProfileId: string | null;
@@ -81,6 +83,15 @@ export class ChatRepository {
     }
   }
 
+  getAuthenticatedProfileId(): string | null {
+    return localStorage.getItem(PREF_AUTH_PROFILE);
+  }
+
+  setAuthenticatedProfileId(profileId: string | null): void {
+    if (profileId) localStorage.setItem(PREF_AUTH_PROFILE, profileId);
+    else localStorage.removeItem(PREF_AUTH_PROFILE);
+  }
+
   setSelectedChatForProfile(profileId: string, chatId: string | null): void {
     const prefs = this.getPreferences();
     prefs.selectedChatByProfile[profileId] = chatId;
@@ -114,6 +125,81 @@ export class ChatRepository {
     });
     this.publish("profiles.changed");
     return profile;
+  }
+
+  async signUpLocalAccount(displayName: string, password: string): Promise<Profile> {
+    const existing = await this.getProfiles();
+    if (existing.length > 0) {
+      throw new Error("This browser already has an account. Sign in instead.");
+    }
+    const now = Date.now();
+    const auth = await createPasswordRecord(password);
+    const profile: Profile = {
+      id: createId("profile"),
+      displayName: displayName.trim(),
+      avatarColor: pickAvatarColor(displayName),
+      passwordSalt: auth.salt,
+      passwordHash: auth.hash,
+      passwordIterations: auth.iterations,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const db = await this.getDb();
+    await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
+      tx.objectStore(STORE_PROFILES).put(profile);
+    });
+    this.setActiveProfileId(profile.id);
+    this.setAuthenticatedProfileId(profile.id);
+    this.publish("profiles.changed");
+    return profile;
+  }
+
+  async signInLocalAccount(password: string): Promise<Profile> {
+    const profiles = await this.getProfiles();
+    const profile = profiles[0];
+    if (!profile) {
+      throw new Error("No account found in this browser. Sign up first.");
+    }
+    if (!profile.passwordHash || !profile.passwordSalt || !profile.passwordIterations) {
+      throw new Error("This local account has no password set.");
+    }
+    const ok = await verifyPassword(password, {
+      salt: profile.passwordSalt,
+      hash: profile.passwordHash,
+      iterations: profile.passwordIterations,
+    });
+    if (!ok) throw new Error("Incorrect password");
+    this.setActiveProfileId(profile.id);
+    this.setAuthenticatedProfileId(profile.id);
+    return profile;
+  }
+
+  async setPasswordForExistingLocalAccount(password: string): Promise<Profile> {
+    const profiles = await this.getProfiles();
+    const profile = profiles[0];
+    if (!profile) {
+      throw new Error("No local account found.");
+    }
+    const auth = await createPasswordRecord(password);
+    const updated: Profile = {
+      ...profile,
+      passwordSalt: auth.salt,
+      passwordHash: auth.hash,
+      passwordIterations: auth.iterations,
+      updatedAt: Date.now(),
+    };
+    const db = await this.getDb();
+    await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
+      tx.objectStore(STORE_PROFILES).put(updated);
+    });
+    this.setActiveProfileId(updated.id);
+    this.setAuthenticatedProfileId(updated.id);
+    this.publish("profiles.changed");
+    return updated;
+  }
+
+  signOut(): void {
+    this.setAuthenticatedProfileId(null);
   }
 
   async getProfileById(profileId: ProfileId): Promise<Profile | null> {
@@ -313,7 +399,7 @@ export class ChatRepository {
       .map((chat) => {
         const chatMembers = membershipByChat.get(chat.id) ?? [];
         const chatMessages = (messagesByChat.get(chat.id) ?? []).sort((a, b) => a.createdAt - b.createdAt);
-        const lastMessage = chatMessages.at(-1);
+        const lastMessage = chatMessages[chatMessages.length - 1];
 
         let title = chat.title ?? "DM";
         if (chat.type === "dm") {
