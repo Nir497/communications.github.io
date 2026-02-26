@@ -15,6 +15,15 @@ import { formatBytes, formatDateTime, formatTime, navigateHome, navigateToChat, 
 
 type DialogKind = null | "createProfile" | "createDm" | "createGroup" | "addMembers" | "viewMembers";
 
+function toMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const msg = (error as { message?: unknown }).message;
+    if (typeof msg === "string" && msg.trim()) return msg;
+  }
+  return fallback;
+}
+
 const syncBus = new SyncBus();
 const repo = new ChatRepository(syncBus);
 
@@ -234,19 +243,23 @@ export default function App() {
       if (!isSupabaseConfigured) {
         throw new Error("Supabase is not configured in this build.");
       }
-      const identity = await supabaseSignUp(email, password, name);
-      await repo.upsertProfile(identity.profile);
+      const result = await supabaseSignUp(email, password, name);
+      if (result.requiresEmailConfirmation || !result.identity) {
+        toast("Sign-up successful. Check your email to confirm, then sign in.", "info");
+        return;
+      }
+      await repo.upsertProfile(result.identity.profile);
       const remoteProfiles = await listSupabaseProfiles();
       await repo.upsertProfiles(remoteProfiles);
-      repo.setActiveProfileId(identity.profile.id);
-      repo.setAuthenticatedProfileId(identity.profile.id);
-      const profile = identity.profile;
+      repo.setActiveProfileId(result.identity.profile.id);
+      repo.setAuthenticatedProfileId(result.identity.profile.id);
+      const profile = result.identity.profile;
       setActiveProfileId(profile.id);
       setIsAuthenticated(true);
       setRefreshTick((v) => v + 1);
       toast(`Account "${profile.displayName}" created`);
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to sign up", "error");
+      toast(toMessage(e, "Failed to sign up"), "error");
       throw e;
     }
   }
@@ -264,7 +277,7 @@ export default function App() {
       setRefreshTick((v) => v + 1);
       toast(`Signed in as ${profile.displayName}`);
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to sign in", "error");
+      toast(toMessage(e, "Failed to sign in"), "error");
       throw e;
     }
   }
@@ -299,7 +312,7 @@ export default function App() {
       setRefreshTick((v) => v + 1);
       toast("Password set. You are signed in.");
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to set password", "error");
+      toast(toMessage(e, "Failed to set password"), "error");
       throw e;
     }
   }
@@ -600,7 +613,7 @@ function AuthGate(props: {
         }
       }
     } catch (error) {
-      setLocalError(error instanceof Error ? error.message : "Authentication failed");
+      setLocalError(toMessage(error, "Authentication failed"));
     } finally {
       setSubmitting(false);
     }

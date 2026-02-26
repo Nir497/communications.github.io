@@ -7,6 +7,11 @@ export interface SupabaseAuthIdentity {
   email: string;
 }
 
+export interface SupabaseSignUpResult {
+  identity: SupabaseAuthIdentity | null;
+  requiresEmailConfirmation: boolean;
+}
+
 function assertSupabase() {
   if (!isSupabaseConfigured || !supabase) {
     throw new Error("Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.");
@@ -75,7 +80,11 @@ export async function getSupabaseSessionIdentity(): Promise<SupabaseAuthIdentity
   return ensureProfile(session.user);
 }
 
-export async function supabaseSignUp(email: string, password: string, displayName: string): Promise<SupabaseAuthIdentity> {
+export async function supabaseSignUp(
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<SupabaseSignUpResult> {
   const client = assertSupabase();
   const { data, error } = await client.auth.signUp({
     email,
@@ -88,7 +97,16 @@ export async function supabaseSignUp(email: string, password: string, displayNam
   });
   if (error) throw error;
   if (!data.user) throw new Error("Sign-up failed");
-  return ensureProfile(data.user);
+  if (!data.session) {
+    return {
+      identity: null,
+      requiresEmailConfirmation: true,
+    };
+  }
+  return {
+    identity: await ensureProfile(data.user),
+    requiresEmailConfirmation: false,
+  };
 }
 
 export async function supabaseSignIn(email: string, password: string): Promise<SupabaseAuthIdentity> {
