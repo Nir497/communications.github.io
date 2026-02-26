@@ -1,5 +1,13 @@
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  getSupabaseSessionIdentity,
+  listSupabaseProfiles,
+  supabaseSignIn,
+  supabaseSignOut,
+  supabaseSignUp,
+} from "./backend/supabaseAuth";
+import { isSupabaseConfigured } from "./backend/supabaseClient";
 import { ChatRepository } from "./storage/repository";
 import { SyncBus } from "./storage/syncBus";
 import type { Chat, ChatListItem, MessageWithAttachments, Profile } from "./types";
@@ -30,9 +38,21 @@ export default function App() {
     async function boot() {
       try {
         await repo.init();
+        if (isSupabaseConfigured) {
+          const identity = await getSupabaseSessionIdentity();
+          if (identity) {
+            await repo.upsertProfile(identity.profile);
+            repo.setActiveProfileId(identity.profile.id);
+            repo.setAuthenticatedProfileId(identity.profile.id);
+            const remoteProfiles = await listSupabaseProfiles();
+            await repo.upsertProfiles(remoteProfiles);
+          } else {
+            repo.setAuthenticatedProfileId(null);
+          }
+        }
         const prefs = repo.getPreferences();
         if (cancelled) return;
-        setActiveProfileId(prefs.activeProfileId);
+        setActiveProfileId(repo.getAuthenticatedProfileId() ?? prefs.activeProfileId);
         setIsAuthenticated(Boolean(repo.getAuthenticatedProfileId()));
         setReady(true);
       } catch (e) {
@@ -61,8 +81,12 @@ export default function App() {
         if (cancelled) return;
         setProfiles(nextProfiles);
 
-        // Single-account-per-device UI mode: use one active local profile only.
-        let currentProfileId = nextProfiles[0]?.id ?? null;
+        // Local mode uses one browser account; Supabase mode keeps the authenticated account id.
+        let currentProfileId = isSupabaseConfigured
+          ? nextProfiles.some((p) => p.id === activeProfileId)
+            ? activeProfileId
+            : nextProfiles[0]?.id ?? null
+          : nextProfiles[0]?.id ?? null;
         if (currentProfileId && currentProfileId !== activeProfileId) {
           repo.setActiveProfileId(currentProfileId);
           setActiveProfileId(currentProfileId);
@@ -189,7 +213,34 @@ export default function App() {
 
   async function handleSignUp(name: string, password: string) {
     try {
-      const profile = await repo.signUpLocalAccount(name, password);
+      let profile: Profile;
+      if (isSupabaseConfigured) {
+        throw new Error("Email is required for Supabase sign up");
+      } else {
+        profile = await repo.signUpLocalAccount(name, password);
+      }
+      setActiveProfileId(profile.id);
+      setIsAuthenticated(true);
+      setRefreshTick((v) => v + 1);
+      toast(`Account "${profile.displayName}" created`);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to sign up", "error");
+      throw e;
+    }
+  }
+
+  async function handleSignUpWithEmail(name: string, email: string, password: string) {
+    try {
+      if (!isSupabaseConfigured) {
+        throw new Error("Supabase is not configured in this build.");
+      }
+      const identity = await supabaseSignUp(email, password, name);
+      await repo.upsertProfile(identity.profile);
+      const remoteProfiles = await listSupabaseProfiles();
+      await repo.upsertProfiles(remoteProfiles);
+      repo.setActiveProfileId(identity.profile.id);
+      repo.setAuthenticatedProfileId(identity.profile.id);
+      const profile = identity.profile;
       setActiveProfileId(profile.id);
       setIsAuthenticated(true);
       setRefreshTick((v) => v + 1);
@@ -202,7 +253,34 @@ export default function App() {
 
   async function handleSignIn(password: string) {
     try {
-      const profile = await repo.signInLocalAccount(password);
+      let profile: Profile;
+      if (isSupabaseConfigured) {
+        throw new Error("Email is required for Supabase sign in");
+      } else {
+        profile = await repo.signInLocalAccount(password);
+      }
+      setActiveProfileId(profile.id);
+      setIsAuthenticated(true);
+      setRefreshTick((v) => v + 1);
+      toast(`Signed in as ${profile.displayName}`);
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Failed to sign in", "error");
+      throw e;
+    }
+  }
+
+  async function handleSignInWithEmail(email: string, password: string) {
+    try {
+      if (!isSupabaseConfigured) {
+        throw new Error("Supabase is not configured in this build.");
+      }
+      const identity = await supabaseSignIn(email, password);
+      await repo.upsertProfile(identity.profile);
+      const remoteProfiles = await listSupabaseProfiles();
+      await repo.upsertProfiles(remoteProfiles);
+      repo.setActiveProfileId(identity.profile.id);
+      repo.setAuthenticatedProfileId(identity.profile.id);
+      const profile = identity.profile;
       setActiveProfileId(profile.id);
       setIsAuthenticated(true);
       setRefreshTick((v) => v + 1);
@@ -227,14 +305,22 @@ export default function App() {
   }
 
   function handleSignOut() {
-    repo.signOut();
-    setIsAuthenticated(false);
-    setSelectedChatId(null);
-    setSelectedChat(null);
-    setMessages([]);
-    setChatMembers([]);
-    navigateHome();
-    toast("Signed out");
+    const run = async () => {
+      if (isSupabaseConfigured) {
+        await supabaseSignOut();
+      }
+      repo.signOut();
+      setIsAuthenticated(false);
+      setSelectedChatId(null);
+      setSelectedChat(null);
+      setMessages([]);
+      setChatMembers([]);
+      navigateHome();
+      toast("Signed out");
+    };
+    void run().catch((e) => {
+      toast(e instanceof Error ? e.message : "Sign out failed", "error");
+    });
   }
 
   async function handleCreateDm(otherProfileId: string) {
@@ -326,8 +412,11 @@ export default function App() {
         <AuthGate
           existingProfile={profiles[0] ?? null}
           onSignUp={handleSignUp}
+          onSignUpWithEmail={handleSignUpWithEmail}
           onSignIn={handleSignIn}
+          onSignInWithEmail={handleSignInWithEmail}
           onSetPassword={handleSetPassword}
+          useSupabaseAuth={isSupabaseConfigured}
         />
         <div className="toast-stack" aria-live="polite">
           {toasts.map((item) => (
@@ -450,23 +539,36 @@ export default function App() {
 function AuthGate(props: {
   existingProfile: Profile | null;
   onSignUp: (name: string, password: string) => Promise<void>;
+  onSignUpWithEmail: (name: string, email: string, password: string) => Promise<void>;
   onSignIn: (password: string) => Promise<void>;
+  onSignInWithEmail: (email: string, password: string) => Promise<void>;
   onSetPassword: (password: string) => Promise<void>;
+  useSupabaseAuth: boolean;
 }) {
   const hasAccount = Boolean(props.existingProfile);
-  const needsPasswordSetup = Boolean(props.existingProfile && !props.existingProfile.passwordHash);
+  const hasLocalAccount = Boolean(props.existingProfile);
+  const needsPasswordSetup = Boolean(!props.useSupabaseAuth && props.existingProfile && !props.existingProfile.passwordHash);
   const [mode, setMode] = useState<"signup" | "signin" | "setup">(
-    !hasAccount ? "signup" : needsPasswordSetup ? "setup" : "signin",
+    props.useSupabaseAuth ? "signin" : !hasLocalAccount ? "signup" : needsPasswordSetup ? "setup" : "signin",
   );
   const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
-    setMode(!props.existingProfile ? "signup" : !props.existingProfile.passwordHash ? "setup" : "signin");
-  }, [props.existingProfile]);
+    setMode(
+      props.useSupabaseAuth
+        ? "signin"
+        : !props.existingProfile
+          ? "signup"
+          : !props.existingProfile.passwordHash
+            ? "setup"
+            : "signin",
+    );
+  }, [props.existingProfile, props.useSupabaseAuth]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -478,14 +580,24 @@ function AuthGate(props: {
         if (!name.trim()) throw new Error("Enter an account name");
         if (password.length < 6) throw new Error("Password must be at least 6 characters");
         if (password !== confirmPassword) throw new Error("Passwords do not match");
-        await props.onSignUp(name, password);
+        if (props.useSupabaseAuth) {
+          if (!email.trim()) throw new Error("Enter your email");
+          await props.onSignUpWithEmail(name, email.trim(), password);
+        } else {
+          await props.onSignUp(name, password);
+        }
       } else if (mode === "setup") {
         if (password.length < 6) throw new Error("Password must be at least 6 characters");
         if (password !== confirmPassword) throw new Error("Passwords do not match");
         await props.onSetPassword(password);
       } else {
         if (!password) throw new Error("Enter your password");
-        await props.onSignIn(password);
+        if (props.useSupabaseAuth) {
+          if (!email.trim()) throw new Error("Enter your email");
+          await props.onSignInWithEmail(email.trim(), password);
+        } else {
+          await props.onSignIn(password);
+        }
       }
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Authentication failed");
@@ -500,15 +612,34 @@ function AuthGate(props: {
         <div className="auth-header">
           <div className="brand">Local Texting</div>
           <p className="brand-subtle">
-            {hasAccount
-              ? needsPasswordSetup
-                ? `Set a password for ${props.existingProfile?.displayName}`
-                : `Sign in to ${props.existingProfile?.displayName}`
-              : "Create an account for this browser/device"}
+            {props.useSupabaseAuth
+              ? "Sign in or sign up with your Supabase account"
+              : hasAccount
+                ? needsPasswordSetup
+                  ? `Set a password for ${props.existingProfile?.displayName}`
+                  : `Sign in to ${props.existingProfile?.displayName}`
+                : "Create an account for this browser/device"}
           </p>
         </div>
 
-        {!hasAccount ? (
+        {props.useSupabaseAuth ? (
+          <div className="auth-tabs">
+            <button
+              className={`ghost-btn ${mode === "signup" ? "active-tab" : ""}`}
+              onClick={() => setMode("signup")}
+              type="button"
+            >
+              Sign Up
+            </button>
+            <button
+              className={`ghost-btn ${mode === "signin" ? "active-tab" : ""}`}
+              onClick={() => setMode("signin")}
+              type="button"
+            >
+              Sign In
+            </button>
+          </div>
+        ) : !hasLocalAccount ? (
           <div className="auth-tabs auth-single-tab">
             <button className="ghost-btn active-tab" type="button">
               Sign Up
@@ -527,6 +658,18 @@ function AuthGate(props: {
             <>
               <label className="label">Account name</label>
               <input className="text-input" value={name} onChange={(e) => setName(e.target.value)} />
+              {props.useSupabaseAuth && (
+                <>
+                  <label className="label">Email</label>
+                  <input
+                    className="text-input"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    autoComplete="email"
+                  />
+                </>
+              )}
               <label className="label">Password</label>
               <input
                 className="text-input"
@@ -571,6 +714,25 @@ function AuthGate(props: {
                 autoComplete="new-password"
               />
             </>
+          ) : props.useSupabaseAuth ? (
+            <>
+              <label className="label">Email</label>
+              <input
+                className="text-input"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="email"
+              />
+              <label className="label">Password</label>
+              <input
+                className="text-input"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+            </>
           ) : (
             <>
               <label className="label">Account</label>
@@ -602,7 +764,9 @@ function AuthGate(props: {
           </button>
           {localError && <div className="auth-error">{localError}</div>}
           <p className="auth-note">
-            GitHub Pages can host this frontend, but real cross-device messaging/accounts require a backend service.
+            {props.useSupabaseAuth
+              ? "Supabase auth is enabled. Profiles can be shared across browsers/devices."
+              : "GitHub Pages can host this frontend, but real cross-device messaging/accounts require a backend service."}
           </p>
         </form>
       </div>

@@ -127,6 +127,24 @@ export class ChatRepository {
     return profile;
   }
 
+  async upsertProfile(profile: Profile): Promise<void> {
+    const db = await this.getDb();
+    await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
+      tx.objectStore(STORE_PROFILES).put(profile);
+    });
+    this.publish("profiles.changed");
+  }
+
+  async upsertProfiles(profiles: Profile[]): Promise<void> {
+    if (profiles.length === 0) return;
+    const db = await this.getDb();
+    await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
+      const store = tx.objectStore(STORE_PROFILES);
+      profiles.forEach((profile) => store.put(profile));
+    });
+    this.publish("profiles.changed");
+  }
+
   async signUpLocalAccount(displayName: string, password: string): Promise<Profile> {
     const existing = await this.getProfiles();
     if (existing.length > 0) {
