@@ -65,7 +65,7 @@ export default function App() {
         setIsAuthenticated(Boolean(repo.getAuthenticatedProfileId()));
         setReady(true);
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to initialize app storage");
+        setError(toMessage(e, "Failed to initialize app"));
       }
     }
     void boot();
@@ -165,7 +165,7 @@ export default function App() {
         setMessages(msgs);
       } catch (e) {
         if (!cancelled) {
-          setError(e instanceof Error ? e.message : "Failed to load data");
+          setError(toMessage(e, "Failed to load data"));
         }
       }
     }
@@ -414,11 +414,20 @@ export default function App() {
   }
 
   if (error) {
+    const looksLikeStorageIssue =
+      /indexeddb|localstorage|quota|storage/i.test(error);
     return (
       <div className="app-error">
-        <h1>Storage Error</h1>
+        <h1>{looksLikeStorageIssue ? "Storage Error" : "Initialization Error"}</h1>
         <p>{error}</p>
-        <p>This app requires browser storage (IndexedDB/localStorage) to be enabled.</p>
+        {looksLikeStorageIssue ? (
+          <p>This app requires browser storage (IndexedDB/localStorage) to be enabled.</p>
+        ) : isSupabaseConfigured ? (
+          <p>
+            If you are using Supabase, verify you ran <code>supabase/schema.sql</code> and created the
+            <code> chat-files </code> storage bucket.
+          </p>
+        ) : null}
       </div>
     );
   }
