@@ -2,7 +2,6 @@ import type { FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getSupabaseSessionIdentity,
-  listSupabaseProfiles,
   supabaseSignIn,
   supabaseSignOut,
   supabaseSignUp,
@@ -50,11 +49,8 @@ export default function App() {
         if (isSupabaseConfigured) {
           const identity = await getSupabaseSessionIdentity();
           if (identity) {
-            await repo.upsertProfile(identity.profile);
             repo.setActiveProfileId(identity.profile.id);
             repo.setAuthenticatedProfileId(identity.profile.id);
-            const remoteProfiles = await listSupabaseProfiles();
-            await repo.upsertProfiles(remoteProfiles);
           } else {
             repo.setAuthenticatedProfileId(null);
           }
@@ -256,9 +252,6 @@ export default function App() {
         toast("Sign-up successful. Check your email to confirm, then sign in.", "info");
         return;
       }
-      await repo.upsertProfile(result.identity.profile);
-      const remoteProfiles = await listSupabaseProfiles();
-      await repo.upsertProfiles(remoteProfiles);
       repo.setActiveProfileId(result.identity.profile.id);
       repo.setAuthenticatedProfileId(result.identity.profile.id);
       const profile = result.identity.profile;
@@ -296,9 +289,6 @@ export default function App() {
         throw new Error("Supabase is not configured in this build.");
       }
       const identity = await supabaseSignIn(email, password);
-      await repo.upsertProfile(identity.profile);
-      const remoteProfiles = await listSupabaseProfiles();
-      await repo.upsertProfiles(remoteProfiles);
       repo.setActiveProfileId(identity.profile.id);
       repo.setAuthenticatedProfileId(identity.profile.id);
       const profile = identity.profile;
