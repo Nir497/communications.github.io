@@ -184,6 +184,14 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toasts]);
 
+  useEffect(() => {
+    if (!ready || !isAuthenticated || !isSupabaseConfigured) return;
+    const timer = window.setInterval(() => {
+      setRefreshTick((v) => v + 1);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [ready, isAuthenticated]);
+
   const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
   const dmItems = chatItems.filter((item) => item.chat.type === "dm");
   const groupItems = chatItems.filter((item) => item.chat.type === "group");

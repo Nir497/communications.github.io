@@ -16,6 +16,7 @@ import type {
   ValidationResult,
 } from "../types";
 import { createPasswordRecord, verifyPassword } from "../auth";
+import { isSupabaseConfigured, supabase } from "../backend/supabaseClient";
 import { createId, isImageMime, pickAvatarColor } from "../utils";
 import { SyncBus } from "./syncBus";
 
@@ -34,6 +35,7 @@ const PREF_ACTIVE_PROFILE = "ltx:activeProfileId";
 const PREF_SELECTED_BY_PROFILE = "ltx:selectedChatByProfile";
 const PREF_SEEDED = "ltx:hasSeededDemoData";
 const PREF_AUTH_PROFILE = "ltx:authProfileId";
+const CHAT_FILES_BUCKET = "chat-files";
 
 export interface AppPreferences {
   activeProfileId: string | null;
@@ -103,6 +105,14 @@ export class ChatRepository {
   }
 
   async getProfiles(): Promise<Profile[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id, display_name, avatar_color, created_at, updated_at")
+        .order("display_name", { ascending: true });
+      if (error) throw error;
+      return (data ?? []).map(mapProfileRow);
+    }
     const db = await this.getDb();
     const profiles = (await getAll<Profile>(db, STORE_PROFILES)).sort((a, b) =>
       a.displayName.localeCompare(b.displayName),
@@ -128,6 +138,20 @@ export class ChatRepository {
   }
 
   async upsertProfile(profile: Profile): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase.from("profiles").upsert(
+        {
+          id: profile.id,
+          display_name: profile.displayName,
+          avatar_color: profile.avatarColor,
+          updated_at: new Date(profile.updatedAt).toISOString(),
+        },
+        { onConflict: "id" },
+      );
+      if (error) throw error;
+      this.publish("profiles.changed");
+      return;
+    }
     const db = await this.getDb();
     await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
       tx.objectStore(STORE_PROFILES).put(profile);
@@ -137,6 +161,18 @@ export class ChatRepository {
 
   async upsertProfiles(profiles: Profile[]): Promise<void> {
     if (profiles.length === 0) return;
+    if (isSupabaseConfigured && supabase) {
+      const rows = profiles.map((profile) => ({
+        id: profile.id,
+        display_name: profile.displayName,
+        avatar_color: profile.avatarColor,
+        updated_at: new Date(profile.updatedAt).toISOString(),
+      }));
+      const { error } = await supabase.from("profiles").upsert(rows, { onConflict: "id" });
+      if (error) throw error;
+      this.publish("profiles.changed");
+      return;
+    }
     const db = await this.getDb();
     await runTransaction(db, [STORE_PROFILES], "readwrite", async (tx) => {
       const store = tx.objectStore(STORE_PROFILES);
@@ -221,11 +257,59 @@ export class ChatRepository {
   }
 
   async getProfileById(profileId: ProfileId): Promise<Profile | null> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id, display_name, avatar_color, created_at, updated_at")
+        .eq("id", profileId)
+        .maybeSingle();
+      if (error) throw error;
+      return data ? mapProfileRow(data) : null;
+    }
     const db = await this.getDb();
     return (await getByKey<Profile>(db, STORE_PROFILES, profileId)) ?? null;
   }
 
   async createDm(activeProfileId: ProfileId, otherProfileId: ProfileId): Promise<Chat> {
+    if (isSupabaseConfigured && supabase) {
+      const existing = await this.findExistingDm(activeProfileId, otherProfileId);
+      if (existing) return existing;
+      const nowIso = new Date().toISOString();
+      const { data: chatRow, error: chatError } = await supabase
+        .from("chats")
+        .insert({
+          type: "dm",
+          title: null,
+          created_by: activeProfileId,
+          created_at: nowIso,
+          updated_at: nowIso,
+          last_message_at: null,
+        })
+        .select("id, type, title, created_by, created_at, updated_at, last_message_at")
+        .single();
+      if (chatError) throw chatError;
+
+      const { error: ownerMembershipError } = await supabase.from("chat_memberships").insert({
+        chat_id: chatRow.id,
+        profile_id: activeProfileId,
+        role: "owner",
+        joined_at: nowIso,
+        left_at: null,
+      });
+      if (ownerMembershipError) throw ownerMembershipError;
+
+      const { error: otherMembershipError } = await supabase.from("chat_memberships").insert({
+        chat_id: chatRow.id,
+        profile_id: otherProfileId,
+        role: "member",
+        joined_at: nowIso,
+        left_at: null,
+      });
+      if (otherMembershipError) throw otherMembershipError;
+      this.publish("chats.changed");
+      this.publish("memberships.changed");
+      return mapChatRow(chatRow);
+    }
     const db = await this.getDb();
     const existing = await this.findExistingDm(activeProfileId, otherProfileId);
     if (existing) return existing;
@@ -260,6 +344,60 @@ export class ChatRepository {
   }
 
   async createGroup(input: CreateGroupInput): Promise<Chat> {
+    if (isSupabaseConfigured && supabase) {
+      const nowIso = new Date().toISOString();
+      const uniqueMembers = [...new Set([input.ownerProfileId, ...input.memberProfileIds])];
+      const { data: chatRow, error: chatError } = await supabase
+        .from("chats")
+        .insert({
+          type: "group",
+          title: input.title.trim() || "Untitled Group",
+          created_by: input.ownerProfileId,
+          created_at: nowIso,
+          updated_at: nowIso,
+          last_message_at: nowIso,
+        })
+        .select("id, type, title, created_by, created_at, updated_at, last_message_at")
+        .single();
+      if (chatError) throw chatError;
+
+      const { error: ownerMembershipError } = await supabase.from("chat_memberships").insert({
+        chat_id: chatRow.id,
+        profile_id: input.ownerProfileId,
+        role: "owner",
+        joined_at: nowIso,
+        left_at: null,
+      });
+      if (ownerMembershipError) throw ownerMembershipError;
+
+      const otherMembers = uniqueMembers.filter((profileId) => profileId !== input.ownerProfileId);
+      if (otherMembers.length > 0) {
+        const { error: membersError } = await supabase.from("chat_memberships").insert(
+          otherMembers.map((profileId) => ({
+            chat_id: chatRow.id,
+            profile_id: profileId,
+            role: "member",
+            joined_at: nowIso,
+            left_at: null,
+          })),
+        );
+        if (membersError) throw membersError;
+      }
+
+      const { error: systemError } = await supabase.from("messages").insert({
+        chat_id: chatRow.id,
+        sender_profile_id: input.ownerProfileId,
+        type: "system",
+        text: "Group created",
+        attachment_ids: [],
+        created_at: nowIso,
+      });
+      if (systemError) throw systemError;
+      this.publish("chats.changed");
+      this.publish("memberships.changed");
+      this.publish("messages.changed");
+      return mapChatRow(chatRow);
+    }
     const now = Date.now();
     const uniqueMembers = [...new Set([input.ownerProfileId, ...input.memberProfileIds])];
     const chat: Chat = {
@@ -305,6 +443,51 @@ export class ChatRepository {
   }
 
   async addGroupMembers(chatId: ChatId, actorProfileId: ProfileId, profileIds: ProfileId[]): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const ids = [...new Set(profileIds)];
+      if (ids.length === 0) return;
+      const nowIso = new Date().toISOString();
+      const currentMemberships = await this.getMembershipsByChat(chatId);
+      const activeMemberSet = new Set(currentMemberships.filter((m) => m.leftAt === null).map((m) => m.profileId));
+      const existingProfiles = await this.getProfiles();
+      const namesById = new Map(existingProfiles.map((p) => [p.id, p.displayName]));
+
+      const toAdd = ids.filter((profileId) => !activeMemberSet.has(profileId));
+      if (toAdd.length === 0) return;
+
+      const { error: membershipError } = await supabase.from("chat_memberships").insert(
+        toAdd.map((profileId) => ({
+          chat_id: chatId,
+          profile_id: profileId,
+          role: "member",
+          joined_at: nowIso,
+          left_at: null,
+        })),
+      );
+      if (membershipError) throw membershipError;
+
+      const { error: systemError } = await supabase.from("messages").insert(
+        toAdd.map((profileId) => ({
+          chat_id: chatId,
+          sender_profile_id: actorProfileId,
+          type: "system",
+          text: `${namesById.get(profileId) ?? "User"} was added to the group`,
+          attachment_ids: [],
+          created_at: nowIso,
+        })),
+      );
+      if (systemError) throw systemError;
+
+      const { error: chatUpdateError } = await supabase
+        .from("chats")
+        .update({ updated_at: nowIso, last_message_at: nowIso })
+        .eq("id", chatId);
+      if (chatUpdateError) throw chatUpdateError;
+      this.publish("memberships.changed");
+      this.publish("messages.changed");
+      this.publish("chats.changed");
+      return;
+    }
     const ids = [...new Set(profileIds)];
     if (ids.length === 0) return;
     const db = await this.getDb();
@@ -353,6 +536,35 @@ export class ChatRepository {
   }
 
   async leaveGroup(chatId: ChatId, profileId: ProfileId): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const nowIso = new Date().toISOString();
+      const profile = await this.getProfileById(profileId);
+      const { error: membershipError } = await supabase
+        .from("chat_memberships")
+        .update({ left_at: nowIso })
+        .eq("chat_id", chatId)
+        .eq("profile_id", profileId)
+        .is("left_at", null);
+      if (membershipError) throw membershipError;
+      const { error: systemError } = await supabase.from("messages").insert({
+        chat_id: chatId,
+        sender_profile_id: profileId,
+        type: "system",
+        text: `${profile?.displayName ?? "User"} left the group`,
+        attachment_ids: [],
+        created_at: nowIso,
+      });
+      if (systemError) throw systemError;
+      const { error: chatUpdateError } = await supabase
+        .from("chats")
+        .update({ updated_at: nowIso, last_message_at: nowIso })
+        .eq("id", chatId);
+      if (chatUpdateError) throw chatUpdateError;
+      this.publish("memberships.changed");
+      this.publish("messages.changed");
+      this.publish("chats.changed");
+      return;
+    }
     const db = await this.getDb();
     const memberships = await this.getMembershipsByChat(chatId);
     const active = memberships.find((m) => m.profileId === profileId && m.leftAt === null);
@@ -386,11 +598,32 @@ export class ChatRepository {
   }
 
   async getChat(chatId: ChatId): Promise<Chat | null> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from("chats")
+        .select("id, type, title, created_by, created_at, updated_at, last_message_at")
+        .eq("id", chatId)
+        .maybeSingle();
+      if (error) throw error;
+      return data ? mapChatRow(data) : null;
+    }
     const db = await this.getDb();
     return (await getByKey<Chat>(db, STORE_CHATS, chatId)) ?? null;
   }
 
   async getChatMembers(chatId: ChatId): Promise<Profile[]> {
+    if (isSupabaseConfigured && supabase) {
+      const memberships = await this.getMembershipsByChat(chatId);
+      const activeIds = memberships.filter((m) => m.leftAt === null).map((m) => m.profileId);
+      if (activeIds.length === 0) return [];
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id, display_name, avatar_color, created_at, updated_at")
+        .in("id", activeIds);
+      if (error) throw error;
+      const byId = new Map((data ?? []).map((row) => [row.id, mapProfileRow(row)]));
+      return activeIds.map((id) => byId.get(id)).filter(Boolean) as Profile[];
+    }
     const memberships = await this.getMembershipsByChat(chatId);
     const activeIds = memberships.filter((m) => m.leftAt === null).map((m) => m.profileId);
     if (activeIds.length === 0) return [];
@@ -400,6 +633,79 @@ export class ChatRepository {
   }
 
   async getVisibleChatsForProfile(profileId: ProfileId): Promise<ChatListItem[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data: ownMemberships, error: ownMembershipsError } = await supabase
+        .from("chat_memberships")
+        .select("chat_id")
+        .eq("profile_id", profileId)
+        .is("left_at", null);
+      if (ownMembershipsError) throw ownMembershipsError;
+      const chatIds = [...new Set((ownMemberships ?? []).map((m) => m.chat_id))];
+      if (chatIds.length === 0) return [];
+
+      const [{ data: chatRows, error: chatsError }, { data: membershipRows, error: membershipsError }, { data: messageRows, error: messagesError }] =
+        await Promise.all([
+          supabase
+            .from("chats")
+            .select("id, type, title, created_by, created_at, updated_at, last_message_at")
+            .in("id", chatIds),
+          supabase
+            .from("chat_memberships")
+            .select("id, chat_id, profile_id, role, joined_at, left_at")
+            .in("chat_id", chatIds)
+            .is("left_at", null),
+          supabase
+            .from("messages")
+            .select("id, chat_id, sender_profile_id, type, text, attachment_ids, created_at")
+            .in("chat_id", chatIds)
+            .order("created_at", { ascending: true }),
+        ]);
+      if (chatsError) throw chatsError;
+      if (membershipsError) throw membershipsError;
+      if (messagesError) throw messagesError;
+
+      const activeMemberships = (membershipRows ?? []).map(mapMembershipRow);
+      const membershipByChat = groupBy(activeMemberships, (m) => m.chatId);
+      const messagesByChat = groupBy((messageRows ?? []).map(mapMessageRow), (m) => m.chatId);
+      const memberIds = [...new Set(activeMemberships.map((m) => m.profileId))];
+      const { data: profileRows, error: profilesError } = await supabase
+        .from("profiles")
+        .select("id, display_name, avatar_color, created_at, updated_at")
+        .in("id", memberIds);
+      if (profilesError) throw profilesError;
+      const profilesById = new Map((profileRows ?? []).map((row) => [row.id, mapProfileRow(row)]));
+
+      return (chatRows ?? [])
+        .map(mapChatRow)
+        .map((chat) => {
+          const chatMembers = membershipByChat.get(chat.id) ?? [];
+          const chatMessages = (messagesByChat.get(chat.id) ?? []).sort((a, b) => a.createdAt - b.createdAt);
+          const lastMessage = chatMessages[chatMessages.length - 1];
+
+          let title = chat.title ?? "DM";
+          if (chat.type === "dm") {
+            const other = chatMembers.find((m) => m.profileId !== profileId);
+            title = other ? profilesById.get(other.profileId)?.displayName ?? "Unknown" : "DM";
+          }
+
+          let subtitle = "No messages yet";
+          if (lastMessage) {
+            subtitle =
+              lastMessage.type === "system"
+                ? lastMessage.text ?? "System"
+                : lastMessage.text?.trim() || (lastMessage.attachmentIds.length > 0 ? "Attachment" : "Message");
+          }
+
+          return {
+            chat,
+            title,
+            subtitle,
+            lastMessageAt: chat.lastMessageAt,
+            memberCount: chatMembers.length,
+          } satisfies ChatListItem;
+        })
+        .sort((a, b) => (b.lastMessageAt ?? b.chat.updatedAt) - (a.lastMessageAt ?? a.chat.updatedAt));
+    }
     const [chats, memberships, messages, profiles] = await Promise.all([
       this.getAllChats(),
       this.getAllMemberships(),
@@ -446,6 +752,38 @@ export class ChatRepository {
   }
 
   async getMessages(chatId: ChatId): Promise<MessageWithAttachments[]> {
+    if (isSupabaseConfigured && supabase) {
+      const [{ data: messageRows, error: messagesError }, { data: attachmentRows, error: attachmentsError }] =
+        await Promise.all([
+          supabase
+            .from("messages")
+            .select("id, chat_id, sender_profile_id, type, text, attachment_ids, created_at")
+            .eq("chat_id", chatId)
+            .order("created_at", { ascending: true }),
+          supabase
+            .from("attachments")
+            .select("id, message_id, chat_id, kind, file_name, mime_type, size_bytes, storage_path, created_at")
+            .eq("chat_id", chatId),
+        ]);
+      if (messagesError) throw messagesError;
+      if (attachmentsError) throw attachmentsError;
+      const metas = (attachmentRows ?? []).map(mapAttachmentMetaRow);
+      const metaByMessage = groupBy(metas, (meta) => meta.messageId);
+      const result: MessageWithAttachments[] = [];
+      for (const message of (messageRows ?? []).map(mapMessageRow)) {
+        const attachmentsMeta = metaByMessage.get(message.id) ?? [];
+        const attachments: AttachmentWithBlob[] = [];
+        for (const meta of attachmentsMeta) {
+          const { data: blob, error: blobError } = await supabase.storage
+            .from(CHAT_FILES_BUCKET)
+            .download(meta.blobKey);
+          if (blobError || !blob) continue;
+          attachments.push({ ...meta, blob });
+        }
+        result.push({ ...message, attachments });
+      }
+      return result;
+    }
     const [messages, metas] = await Promise.all([this.getAllMessages(), this.getAllAttachmentMeta()]);
     const db = await this.getDb();
     const inChat = messages.filter((message) => message.chatId === chatId).sort((a, b) => a.createdAt - b.createdAt);
@@ -481,9 +819,76 @@ export class ChatRepository {
     }
 
     const now = Date.now();
+    const messageType = deriveMessageType(text, input.files);
+
+    if (isSupabaseConfigured && supabase) {
+      const nowIso = new Date(now).toISOString();
+      const { data: insertedMessage, error: messageError } = await supabase
+        .from("messages")
+        .insert({
+          chat_id: input.chatId,
+          sender_profile_id: input.senderProfileId,
+          type: messageType,
+          text: text || null,
+          attachment_ids: [],
+          created_at: nowIso,
+        })
+        .select("id, chat_id, sender_profile_id, type, text, attachment_ids, created_at")
+        .single();
+      if (messageError) throw messageError;
+
+      const attachmentIds: string[] = [];
+      for (const file of input.files) {
+        const objectKey = `${input.chatId}/${insertedMessage.id}/${crypto.randomUUID()}-${file.name}`;
+        const { error: uploadError } = await supabase.storage.from(CHAT_FILES_BUCKET).upload(objectKey, file, {
+          upsert: false,
+          contentType: file.type || "application/octet-stream",
+        });
+        if (uploadError) {
+          throw new Error(
+            `Upload failed for "${file.name}". Create the Supabase storage bucket "${CHAT_FILES_BUCKET}" and retry.`,
+          );
+        }
+        const { data: attRow, error: attError } = await supabase
+          .from("attachments")
+          .insert({
+            message_id: insertedMessage.id,
+            chat_id: input.chatId,
+            kind: isImageMime(file.type) ? "image" : "file",
+            file_name: file.name,
+            mime_type: file.type || "application/octet-stream",
+            size_bytes: file.size,
+            storage_path: objectKey,
+            created_at: nowIso,
+          })
+          .select("id")
+          .single();
+        if (attError) throw attError;
+        attachmentIds.push(attRow.id);
+      }
+
+      if (attachmentIds.length > 0) {
+        const { error: updateMessageError } = await supabase
+          .from("messages")
+          .update({ attachment_ids: attachmentIds })
+          .eq("id", insertedMessage.id);
+        if (updateMessageError) throw updateMessageError;
+      }
+      const { error: updateChatError } = await supabase
+        .from("chats")
+        .update({ updated_at: nowIso, last_message_at: nowIso })
+        .eq("id", input.chatId);
+      if (updateChatError) throw updateChatError;
+
+      this.publish("messages.changed");
+      this.publish("chats.changed");
+      const mapped = mapMessageRow(insertedMessage);
+      mapped.attachmentIds = attachmentIds;
+      return mapped;
+    }
+
     const messageId = createId("msg");
     const attachmentIds: string[] = [];
-    const messageType = deriveMessageType(text, input.files);
 
     const message: Message = {
       id: messageId,
@@ -551,6 +956,11 @@ export class ChatRepository {
   }
 
   async getTotalAttachmentBytes(): Promise<number> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase.from("attachments").select("size_bytes");
+      if (error) throw error;
+      return (data ?? []).reduce((sum, meta) => sum + Number(meta.size_bytes ?? 0), 0);
+    }
     const metas = await this.getAllAttachmentMeta();
     return metas.reduce((sum, meta) => sum + meta.sizeBytes, 0);
   }
@@ -754,22 +1164,84 @@ export class ChatRepository {
   }
 
   async canProfileAccessChat(profileId: ProfileId, chatId: ChatId): Promise<boolean> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from("chat_memberships")
+        .select("id")
+        .eq("chat_id", chatId)
+        .eq("profile_id", profileId)
+        .is("left_at", null)
+        .limit(1);
+      if (error) throw error;
+      return (data ?? []).length > 0;
+    }
     const memberships = await this.getMembershipsByChat(chatId);
     return memberships.some((m) => m.profileId === profileId && m.leftAt === null);
   }
 
   async getCandidateProfilesForGroupAdd(chatId: ChatId): Promise<Profile[]> {
+    if (isSupabaseConfigured && supabase) {
+      const [profiles, members] = await Promise.all([this.getProfiles(), this.getChatMembers(chatId)]);
+      const memberIds = new Set(members.map((p) => p.id));
+      return profiles.filter((profile) => !memberIds.has(profile.id));
+    }
     const [profiles, members] = await Promise.all([this.getProfiles(), this.getChatMembers(chatId)]);
     const memberIds = new Set(members.map((p) => p.id));
     return profiles.filter((profile) => !memberIds.has(profile.id));
   }
 
   private async getMembershipsByChat(chatId: ChatId): Promise<ChatMembership[]> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from("chat_memberships")
+        .select("id, chat_id, profile_id, role, joined_at, left_at")
+        .eq("chat_id", chatId);
+      if (error) throw error;
+      return (data ?? []).map(mapMembershipRow);
+    }
     const memberships = await this.getAllMemberships();
     return memberships.filter((membership) => membership.chatId === chatId);
   }
 
   private async findExistingDm(a: ProfileId, b: ProfileId): Promise<Chat | null> {
+    if (isSupabaseConfigured && supabase) {
+      const [{ data: aMemberships, error: aError }, { data: bMemberships, error: bError }] = await Promise.all([
+        supabase.from("chat_memberships").select("chat_id").eq("profile_id", a).is("left_at", null),
+        supabase.from("chat_memberships").select("chat_id").eq("profile_id", b).is("left_at", null),
+      ]);
+      if (aError) throw aError;
+      if (bError) throw bError;
+
+      const aIds = new Set((aMemberships ?? []).map((m) => m.chat_id));
+      const candidateIds = [...new Set((bMemberships ?? []).map((m) => m.chat_id))].filter((id) => aIds.has(id));
+      if (candidateIds.length === 0) return null;
+
+      const { data: dmChats, error: chatsError } = await supabase
+        .from("chats")
+        .select("id, type, title, created_by, created_at, updated_at, last_message_at")
+        .eq("type", "dm")
+        .in("id", candidateIds);
+      if (chatsError) throw chatsError;
+      if (!dmChats || dmChats.length === 0) return null;
+
+      const dmIds = dmChats.map((chat) => chat.id);
+      const { data: memberships, error: membersError } = await supabase
+        .from("chat_memberships")
+        .select("chat_id, profile_id")
+        .in("chat_id", dmIds)
+        .is("left_at", null);
+      if (membersError) throw membersError;
+      const byChat = groupBy(memberships ?? [], (row) => row.chat_id);
+      for (const chat of dmChats) {
+        const members = byChat.get(chat.id) ?? [];
+        const ids = [...new Set(members.map((m) => m.profile_id))].sort();
+        const want = [a, b].sort();
+        if (ids.length === 2 && ids[0] === want[0] && ids[1] === want[1]) {
+          return mapChatRow(chat);
+        }
+      }
+      return null;
+    }
     const [chats, memberships] = await Promise.all([this.getAllChats(), this.getAllMemberships()]);
     const active = memberships.filter((m) => m.leftAt === null);
     const membersByChat = groupBy(active, (m) => m.chatId);
@@ -822,6 +1294,114 @@ function deriveMessageType(text: string, files: File[]): Message["type"] {
     return isImageMime(files[0].type) ? "image" : "file";
   }
   return "mixed";
+}
+
+function toMillis(value: string | null | undefined): number {
+  if (!value) return 0;
+  return new Date(value).getTime();
+}
+
+function toMillisNullable(value: string | null | undefined): number | null {
+  if (!value) return null;
+  return new Date(value).getTime();
+}
+
+function mapProfileRow(row: {
+  id: string;
+  display_name: string;
+  avatar_color: string | null;
+  created_at: string;
+  updated_at: string;
+}): Profile {
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    avatarColor: row.avatar_color ?? pickAvatarColor(row.display_name),
+    createdAt: toMillis(row.created_at),
+    updatedAt: toMillis(row.updated_at),
+  };
+}
+
+function mapChatRow(row: {
+  id: string;
+  type: "dm" | "group";
+  title: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at: string | null;
+}): Chat {
+  return {
+    id: row.id,
+    type: row.type,
+    title: row.title,
+    createdByProfileId: row.created_by,
+    createdAt: toMillis(row.created_at),
+    updatedAt: toMillis(row.updated_at),
+    lastMessageAt: toMillisNullable(row.last_message_at),
+  };
+}
+
+function mapMembershipRow(row: {
+  id: string;
+  chat_id: string;
+  profile_id: string;
+  role: "owner" | "member";
+  joined_at: string;
+  left_at: string | null;
+}): ChatMembership {
+  return {
+    id: row.id,
+    chatId: row.chat_id,
+    profileId: row.profile_id,
+    role: row.role,
+    joinedAt: toMillis(row.joined_at),
+    leftAt: toMillisNullable(row.left_at),
+  };
+}
+
+function mapMessageRow(row: {
+  id: string;
+  chat_id: string;
+  sender_profile_id: string;
+  type: Message["type"];
+  text: string | null;
+  attachment_ids: string[] | null;
+  created_at: string;
+}): Message {
+  return {
+    id: row.id,
+    chatId: row.chat_id,
+    senderProfileId: row.sender_profile_id,
+    type: row.type,
+    text: row.text,
+    attachmentIds: row.attachment_ids ?? [],
+    createdAt: toMillis(row.created_at),
+  };
+}
+
+function mapAttachmentMetaRow(row: {
+  id: string;
+  message_id: string;
+  chat_id: string;
+  kind: "image" | "file";
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  storage_path: string;
+  created_at: string;
+}): AttachmentMeta {
+  return {
+    id: row.id,
+    messageId: row.message_id,
+    chatId: row.chat_id,
+    kind: row.kind,
+    fileName: row.file_name,
+    mimeType: row.mime_type,
+    sizeBytes: Number(row.size_bytes),
+    blobKey: row.storage_path,
+    createdAt: toMillis(row.created_at),
+  };
 }
 
 function makeChat(type: Chat["type"], title: string | null, createdByProfileId: string, at: number): Chat {
