@@ -272,7 +272,8 @@ export class ChatRepository {
 
   async createDm(activeProfileId: ProfileId, otherProfileId: ProfileId): Promise<Chat> {
     if (isSupabaseConfigured && supabase) {
-      const existing = await this.findExistingDm(activeProfileId, otherProfileId);
+      const actorProfileId = await this.getSupabaseActorId();
+      const existing = await this.findExistingDm(actorProfileId, otherProfileId);
       if (existing) return existing;
       const nowIso = new Date().toISOString();
       const { data: chatRow, error: chatError } = await supabase
@@ -280,7 +281,7 @@ export class ChatRepository {
         .insert({
           type: "dm",
           title: null,
-          created_by: activeProfileId,
+          created_by: actorProfileId,
           created_at: nowIso,
           updated_at: nowIso,
           last_message_at: null,
@@ -291,7 +292,7 @@ export class ChatRepository {
 
       const { error: ownerMembershipError } = await supabase.from("chat_memberships").insert({
         chat_id: chatRow.id,
-        profile_id: activeProfileId,
+        profile_id: actorProfileId,
         role: "owner",
         joined_at: nowIso,
         left_at: null,
@@ -345,14 +346,15 @@ export class ChatRepository {
 
   async createGroup(input: CreateGroupInput): Promise<Chat> {
     if (isSupabaseConfigured && supabase) {
+      const actorProfileId = await this.getSupabaseActorId();
       const nowIso = new Date().toISOString();
-      const uniqueMembers = [...new Set([input.ownerProfileId, ...input.memberProfileIds])];
+      const uniqueMembers = [...new Set([actorProfileId, ...input.memberProfileIds])];
       const { data: chatRow, error: chatError } = await supabase
         .from("chats")
         .insert({
           type: "group",
           title: input.title.trim() || "Untitled Group",
-          created_by: input.ownerProfileId,
+          created_by: actorProfileId,
           created_at: nowIso,
           updated_at: nowIso,
           last_message_at: nowIso,
@@ -363,14 +365,14 @@ export class ChatRepository {
 
       const { error: ownerMembershipError } = await supabase.from("chat_memberships").insert({
         chat_id: chatRow.id,
-        profile_id: input.ownerProfileId,
+        profile_id: actorProfileId,
         role: "owner",
         joined_at: nowIso,
         left_at: null,
       });
       if (ownerMembershipError) throw ownerMembershipError;
 
-      const otherMembers = uniqueMembers.filter((profileId) => profileId !== input.ownerProfileId);
+      const otherMembers = uniqueMembers.filter((profileId) => profileId !== actorProfileId);
       if (otherMembers.length > 0) {
         const { error: membersError } = await supabase.from("chat_memberships").insert(
           otherMembers.map((profileId) => ({
@@ -386,7 +388,7 @@ export class ChatRepository {
 
       const { error: systemError } = await supabase.from("messages").insert({
         chat_id: chatRow.id,
-        sender_profile_id: input.ownerProfileId,
+        sender_profile_id: actorProfileId,
         type: "system",
         text: "Group created",
         attachment_ids: [],
@@ -444,6 +446,7 @@ export class ChatRepository {
 
   async addGroupMembers(chatId: ChatId, actorProfileId: ProfileId, profileIds: ProfileId[]): Promise<void> {
     if (isSupabaseConfigured && supabase) {
+      const actorId = await this.getSupabaseActorId();
       const ids = [...new Set(profileIds)];
       if (ids.length === 0) return;
       const nowIso = new Date().toISOString();
@@ -469,7 +472,7 @@ export class ChatRepository {
       const { error: systemError } = await supabase.from("messages").insert(
         toAdd.map((profileId) => ({
           chat_id: chatId,
-          sender_profile_id: actorProfileId,
+          sender_profile_id: actorId,
           type: "system",
           text: `${namesById.get(profileId) ?? "User"} was added to the group`,
           attachment_ids: [],
@@ -537,18 +540,19 @@ export class ChatRepository {
 
   async leaveGroup(chatId: ChatId, profileId: ProfileId): Promise<void> {
     if (isSupabaseConfigured && supabase) {
+      const actorId = await this.getSupabaseActorId();
       const nowIso = new Date().toISOString();
-      const profile = await this.getProfileById(profileId);
+      const profile = await this.getProfileById(actorId);
       const { error: membershipError } = await supabase
         .from("chat_memberships")
         .update({ left_at: nowIso })
         .eq("chat_id", chatId)
-        .eq("profile_id", profileId)
+        .eq("profile_id", actorId)
         .is("left_at", null);
       if (membershipError) throw membershipError;
       const { error: systemError } = await supabase.from("messages").insert({
         chat_id: chatId,
-        sender_profile_id: profileId,
+        sender_profile_id: actorId,
         type: "system",
         text: `${profile?.displayName ?? "User"} left the group`,
         attachment_ids: [],
@@ -822,12 +826,13 @@ export class ChatRepository {
     const messageType = deriveMessageType(text, input.files);
 
     if (isSupabaseConfigured && supabase) {
+      const actorId = await this.getSupabaseActorId();
       const nowIso = new Date(now).toISOString();
       const { data: insertedMessage, error: messageError } = await supabase
         .from("messages")
         .insert({
           chat_id: input.chatId,
-          sender_profile_id: input.senderProfileId,
+          sender_profile_id: actorId,
           type: messageType,
           text: text || null,
           attachment_ids: [],
@@ -1285,6 +1290,19 @@ export class ChatRepository {
 
   private publish(type: SyncEvent["type"]): void {
     this.syncBus.publish({ type, at: Date.now() });
+  }
+
+  private async getSupabaseActorId(): Promise<string> {
+    if (!isSupabaseConfigured || !supabase) {
+      throw new Error("Supabase is not configured.");
+    }
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser();
+    if (error) throw error;
+    if (!user) throw new Error("No active Supabase session. Sign in again.");
+    return user.id;
   }
 }
 
