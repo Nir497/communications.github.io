@@ -281,7 +281,6 @@ export class ChatRepository {
         .insert({
           type: "dm",
           title: null,
-          created_by: actorProfileId,
           created_at: nowIso,
           updated_at: nowIso,
           last_message_at: null,
@@ -354,7 +353,6 @@ export class ChatRepository {
         .insert({
           type: "group",
           title: input.title.trim() || "Untitled Group",
-          created_by: actorProfileId,
           created_at: nowIso,
           updated_at: nowIso,
           last_message_at: nowIso,
