@@ -341,7 +341,7 @@ export default function App() {
       setDialog(null);
       handleSelectChat(chat.id);
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to create DM", "error");
+      toast(toMessage(e, "Failed to create DM"), "error");
     }
   }
 
@@ -357,7 +357,7 @@ export default function App() {
       handleSelectChat(chat.id);
       toast("Group created");
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to create group", "error");
+      toast(toMessage(e, "Failed to create group"), "error");
     }
   }
 
@@ -368,7 +368,7 @@ export default function App() {
       setDialog(null);
       toast("Members added");
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to add members", "error");
+      toast(toMessage(e, "Failed to add members"), "error");
     }
   }
 
@@ -384,7 +384,7 @@ export default function App() {
       navigateHome();
       toast("You left the group");
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to leave group", "error");
+      toast(toMessage(e, "Failed to leave group"), "error");
     }
   }
 
@@ -398,7 +398,7 @@ export default function App() {
         files,
       });
     } catch (e) {
-      toast(e instanceof Error ? e.message : "Failed to send message", "error");
+      toast(toMessage(e, "Failed to send message"), "error");
       throw e;
     }
   }
