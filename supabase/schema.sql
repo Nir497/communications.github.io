@@ -64,6 +64,41 @@ alter table public.chat_memberships enable row level security;
 alter table public.messages enable row level security;
 alter table public.attachments enable row level security;
 
+-- Helper functions to avoid recursive RLS evaluation on chat_memberships.
+create or replace function public.is_chat_member(target_chat_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.chat_memberships m
+    where m.chat_id = target_chat_id
+      and m.profile_id = auth.uid()
+      and m.left_at is null
+  );
+$$;
+
+create or replace function public.is_chat_owner(target_chat_id uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.chat_memberships m
+    where m.chat_id = target_chat_id
+      and m.profile_id = auth.uid()
+      and m.left_at is null
+      and m.role = 'owner'
+  );
+$$;
+
+grant execute on function public.is_chat_member(uuid) to authenticated;
+grant execute on function public.is_chat_owner(uuid) to authenticated;
+
 -- Profiles: any signed-in user can view profile directory; users can update only their own profile.
 drop policy if exists "profiles_select_authenticated" on public.profiles;
 create policy "profiles_select_authenticated"
@@ -89,14 +124,7 @@ drop policy if exists "chats_select_member" on public.chats;
 create policy "chats_select_member"
   on public.chats for select
   to authenticated
-  using (
-    exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = chats.id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
-  );
+  using (public.is_chat_member(id));
 
 drop policy if exists "chats_insert_authenticated" on public.chats;
 create policy "chats_insert_authenticated"
@@ -108,39 +136,20 @@ drop policy if exists "chats_update_member" on public.chats;
 create policy "chats_update_member"
   on public.chats for update
   to authenticated
-  using (
-    exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = chats.id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
-  );
+  using (public.is_chat_member(id));
 
 drop policy if exists "memberships_select_member" on public.chat_memberships;
 create policy "memberships_select_member"
   on public.chat_memberships for select
   to authenticated
-  using (
-    exists (
-      select 1 from public.chat_memberships self
-      where self.chat_id = chat_memberships.chat_id
-        and self.profile_id = auth.uid()
-        and self.left_at is null
-    )
-  );
+  using (public.is_chat_member(chat_id));
 
 drop policy if exists "memberships_insert_member" on public.chat_memberships;
 create policy "memberships_insert_member"
   on public.chat_memberships for insert
   to authenticated
   with check (
-    exists (
-      select 1 from public.chat_memberships self
-      where self.chat_id = chat_memberships.chat_id
-        and self.profile_id = auth.uid()
-        and self.left_at is null
-    )
+    public.is_chat_member(chat_id)
     or profile_id = auth.uid()
   );
 
@@ -150,26 +159,14 @@ create policy "memberships_update_self_or_member"
   to authenticated
   using (
     profile_id = auth.uid()
-    or exists (
-      select 1 from public.chat_memberships self
-      where self.chat_id = chat_memberships.chat_id
-        and self.profile_id = auth.uid()
-        and self.left_at is null
-    )
+    or public.is_chat_member(chat_id)
   );
 
 drop policy if exists "messages_select_member" on public.messages;
 create policy "messages_select_member"
   on public.messages for select
   to authenticated
-  using (
-    exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = messages.chat_id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
-  );
+  using (public.is_chat_member(chat_id));
 
 drop policy if exists "messages_insert_member" on public.messages;
 create policy "messages_insert_member"
@@ -177,38 +174,19 @@ create policy "messages_insert_member"
   to authenticated
   with check (
     sender_profile_id = auth.uid()
-    and exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = messages.chat_id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
+    and public.is_chat_member(chat_id)
   );
 
 drop policy if exists "attachments_select_member" on public.attachments;
 create policy "attachments_select_member"
   on public.attachments for select
   to authenticated
-  using (
-    exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = attachments.chat_id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
-  );
+  using (public.is_chat_member(chat_id));
 
 drop policy if exists "attachments_insert_member" on public.attachments;
 create policy "attachments_insert_member"
   on public.attachments for insert
   to authenticated
-  with check (
-    exists (
-      select 1 from public.chat_memberships m
-      where m.chat_id = attachments.chat_id
-        and m.profile_id = auth.uid()
-        and m.left_at is null
-    )
-  );
+  with check (public.is_chat_member(chat_id));
 
 -- Optional: create a storage bucket named `chat-files` in the Supabase Dashboard.
